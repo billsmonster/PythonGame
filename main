@@ -1,0 +1,1377 @@
+#!/usr/bin/env python3
+"""
+Crypt Vault: Streamlined Text-Based Dungeon Crawler (Heavily Commented)
+
+This is a modern Python terminal RPG built to showcase:
+- State management (GameState holds all mutable game data)
+- OOP architecture (Player, Enemy, Room, Item, Game engine)
+- Branching logic (combat/explore/event choices)
+- Persistence (JSON save/load)
+- Tests (lightweight built-in test suite)
+- Polished CLI UX (Rich panels/tables/prompts)
+
+Run:
+  python crypt_vault.py
+  python crypt_vault.py easy|normal|hard
+  python crypt_vault.py load savegame.json
+  python crypt_vault.py test
+
+Dependencies:
+  pip install rich
+"""
+
+# =========================
+# Imports
+# =========================
+
+from __future__ import annotations  # Forward-ref typing support (Python 3.10+ friendly)
+
+import json        # Save/load game state
+import random      # RNG for combat, traps, loot, random events
+import sys         # CLI args and exiting
+import time        # Timing decorator for profiling
+import logging     # Logging to file for debugging
+
+from dataclasses import dataclass, asdict, field  # Dataclasses simplify model definitions
+from enum import Enum                             # Enums for strong typed constants
+from functools import wraps                        # For the @timed decorator
+from typing import Dict, List, Optional, Tuple, Protocol  # Type hints + protocol interface
+
+# =========================
+# Rich (Terminal UI)
+# =========================
+# Rich provides cleaner output than print(), including panels/tables/prompts.
+# If missing, we fail fast and show how to install.
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.prompt import Prompt, Confirm
+    from rich import box
+except ImportError:
+    print("Install rich: pip install rich")
+    sys.exit(1)
+
+console = Console()
+
+# =========================
+# Logging Configuration
+# =========================
+# Logs to a local file so you can debug game behavior after a run.
+
+logging.basicConfig(
+    filename="crypt_vault.log",
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+# =========================
+# Enums & Config
+# =========================
+
+class ItemKind(Enum):
+    """Defines item behavior categories."""
+    CONSUMABLE = "consumable"  # Used once (potions, bombs, etc.)
+    WEAPON = "weapon"          # Equipped weapon -> attack bonus
+    ARMOR = "armor"            # Equipped armor -> defense bonus
+    KEY = "key"                # Key items for locks / quest items
+
+class Difficulty(Enum):
+    """Game difficulty presets."""
+    EASY = "easy"
+    NORMAL = "normal"
+    HARD = "hard"
+
+@dataclass
+class GameConfig:
+    """
+    Centralized game tuning knobs.
+    Keeping these in one place makes balancing easy.
+    """
+    crit_chance: float = 0.15
+    crit_multiplier: float = 2.0
+    base_flee_chance: float = 0.3
+    smoke_bomb_bonus: float = 0.4
+    xp_per_level: int = 100
+    random_event_chance: float = 0.05
+
+# =========================
+# Exceptions
+# =========================
+# Custom exceptions make control-flow errors explicit and clean.
+
+class GameError(Exception):
+    """Base exception for game domain errors."""
+    pass
+
+class ItemNotFoundError(GameError):
+    """Raised when an item name cannot be resolved."""
+    pass
+
+class InvalidActionError(GameError):
+    """Raised when a user command is invalid in the current context."""
+    pass
+
+# =========================
+# Protocols (Interface Types)
+# =========================
+# Protocols provide an "interface" without inheritance.
+# Anything with matching attributes/methods satisfies the protocol.
+
+class Combatant(Protocol):
+    hp: int
+    max_hp: int
+    def alive(self) -> bool: ...
+
+# =========================
+# Utilities
+# =========================
+
+# Allowed movement directions (used for validation)
+DIRECTIONS = {"north", "south", "east", "west"}
+
+# Input synonyms for better UX: users can type "n" instead of "north", etc.
+SYNONYMS = {
+    "n": "north", "s": "south", "e": "east", "w": "west",
+    "get": "take", "pickup": "take", "grab": "take",
+    "examine": "look", "l": "look",
+    "i": "inv", "inventory": "inv",
+    "a": "attack", "fight": "attack",
+    "u": "use",
+    "?": "help", "h": "help"
+}
+
+def timed(func):
+    """
+    Decorator that logs runtime of function calls.
+    Useful for profiling when expanding the game.
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        logging.debug(f"{func.__name__} took {time.perf_counter() - start:.4f}s")
+        return result
+    return wrapper
+
+# Clamp a number to a range (HP never drops below 0 or above max)
+clamp = lambda n, lo, hi: max(lo, min(hi, n))
+
+# Probability roll: roll(0.25) returns True about 25% of the time
+roll = lambda chance: random.random() < chance
+
+# Friendly list printing: ["north","east"] -> "north and east"
+pretty_list = lambda items: (
+    "(none)" if not items else
+    items[0] if len(items) == 1 else
+    ", ".join(items[:-1]) + " and " + items[-1]
+)
+
+# =========================
+# Data Models
+# =========================
+
+@dataclass
+class Item:
+    """
+    Game item definition.
+    Items are stored in an item database (items_db) and referenced by ID.
+    """
+    id: str
+    name: str
+    kind: ItemKind
+    desc: str
+    power: int = 0
+    uses: int = 1
+    stackable: bool = False
+
+    def to_dict(self) -> dict:
+        """
+        Serialize for saving.
+        Enums need conversion to raw values for JSON.
+        """
+        d = asdict(self)
+        d["kind"] = self.kind.value
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Item:
+        """Deserialize from JSON dict."""
+        d["kind"] = ItemKind(d["kind"])
+        return cls(**d)
+
+@dataclass
+class Enemy:
+    """
+    Enemy combatant definition.
+    loot_table contains (item_id, drop_probability).
+    """
+    id: str
+    name: str
+    max_hp: int
+    hp: int
+    attack: int
+    defense: int
+    desc: str
+    loot_table: List[Tuple[str, float]] = field(default_factory=list)
+    xp_reward: int = 10
+
+    # Quick "alive" check
+    alive = lambda self: self.hp > 0
+
+    def to_dict(self) -> dict:
+        """Serialize enemy for saving."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Enemy:
+        """Deserialize enemy; loot_table may come back as lists."""
+        d["loot_table"] = [tuple(x) for x in d.get("loot_table", [])]
+        return cls(**d)
+
+@dataclass
+class Statistics:
+    """
+    Session statistics for 'portfolio polish' and player feedback.
+    Stored in save file as well.
+    """
+    enemies_killed: int = 0
+    items_collected: int = 0
+    damage_taken: int = 0
+    damage_dealt: int = 0
+    rooms_explored: int = 0
+    crits_landed: int = 0
+    successful_flees: int = 0
+
+    to_dict = lambda self: asdict(self)
+    from_dict = classmethod(lambda cls, d: cls(**d))
+
+@dataclass
+class Player:
+    """
+    Player model:
+    - base stats
+    - progression stats (xp, level)
+    - inventory and equipped gear
+    """
+    name: str = "Hero"
+    max_hp: int = 30
+    hp: int = 30
+    base_attack: int = 4
+    base_defense: int = 1
+    gold: int = 0
+    xp: int = 0
+    level: int = 1
+
+    # inventory maps item_id -> quantity
+    inventory: Dict[str, int] = field(default_factory=dict)
+
+    # currently equipped item IDs
+    equipped_weapon: Optional[str] = None
+    equipped_armor: Optional[str] = None
+
+    alive = lambda self: self.hp > 0
+
+    def attack_value(self, db: Dict[str, Item]) -> int:
+        """Compute total attack including weapon bonuses."""
+        return self.base_attack + (db[self.equipped_weapon].power if self.equipped_weapon else 0)
+
+    def defense_value(self, db: Dict[str, Item]) -> int:
+        """Compute total defense including armor bonuses."""
+        return self.base_defense + (db[self.equipped_armor].power if self.equipped_armor else 0)
+
+    def add_item(self, item_id: str, qty: int = 1):
+        """Add or remove an item (negative qty removes)."""
+        self.inventory[item_id] = self.inventory.get(item_id, 0) + qty
+        if self.inventory[item_id] <= 0:
+            self.inventory.pop(item_id, None)
+
+    has_item = lambda self, item_id, qty=1: self.inventory.get(item_id, 0) >= qty
+    to_dict = lambda self: asdict(self)
+    from_dict = classmethod(lambda cls, d: cls(**d))
+
+@dataclass
+class Room:
+    """
+    Room model:
+    - id: unique map key
+    - exits: direction -> room_id graph
+    - items: item IDs laying in the room
+    - enemy: optional enemy encounter
+    - locked: for gating progress (needs key)
+    - traps: random damage on first entry
+    """
+    id: str
+    title: str
+    desc: str
+    exits: Dict[str, str]
+    items: List[str] = field(default_factory=list)
+    enemy: Optional[Enemy] = None
+    visited: bool = False
+
+    locked: bool = False
+    lock_key_id: Optional[str] = None
+
+    trap_chance: float = 0.0
+    trap_damage: int = 0
+
+    on_enter_text: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        """Serialize room. If it has an enemy, serialize that too."""
+        d = asdict(self)
+        if self.enemy:
+            d["enemy"] = self.enemy.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Room:
+        """Deserialize room; restore enemy object if present."""
+        if enemy := d.get("enemy"):
+            d["enemy"] = Enemy.from_dict(enemy)
+        return cls(**d)
+
+@dataclass
+class RandomEvent:
+    """
+    A lightweight narrative event:
+    - text: what the player sees
+    - choices: list of (choice_text, outcome_key)
+    """
+    id: str
+    text: str
+    choices: List[Tuple[str, str]]
+
+@dataclass
+class GameState:
+    """
+    The single source of truth for all mutable game state.
+    Saving/loading is easy because everything important is inside this object.
+    """
+    player: Player
+    current_room_id: str
+    rooms: Dict[str, Room]
+    stats: Statistics
+
+    turn: int = 0
+    game_over: bool = False
+    victory: bool = False
+    difficulty: str = "normal"
+
+    def to_dict(self) -> dict:
+        """Serialize the entire state for persistence."""
+        return {
+            "player": self.player.to_dict(),
+            "current_room_id": self.current_room_id,
+            "rooms": {k: v.to_dict() for k, v in self.rooms.items()},
+            "stats": self.stats.to_dict(),
+            "turn": self.turn,
+            "game_over": self.game_over,
+            "victory": self.victory,
+            "difficulty": self.difficulty,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> GameState:
+        """Deserialize state from a save file."""
+        return cls(
+            player=Player.from_dict(d["player"]),
+            current_room_id=d["current_room_id"],
+            rooms={k: Room.from_dict(v) for k, v in d["rooms"].items()},
+            stats=Statistics.from_dict(d.get("stats", {})),
+            turn=d.get("turn", 0),
+            game_over=d.get("game_over", False),
+            victory=d.get("victory", False),
+            difficulty=d.get("difficulty", "normal"),
+        )
+
+# =========================
+# World Building
+# =========================
+
+def build_items_db() -> Dict[str, Item]:
+    """
+    Define all possible items.
+    Items are referenced elsewhere by their unique 'id'.
+    """
+    items = [
+        ("potion_small", "Small Potion", ItemKind.CONSUMABLE, "Heals 10 HP.", 10, 1, True),
+        ("potion_large", "Large Potion", ItemKind.CONSUMABLE, "Heals 25 HP.", 25, 1, True),
+        ("bomb_smoke", "Smoke Bomb", ItemKind.CONSUMABLE, "Improves flee chance.", 0, 1, True),
+        ("sword_rusty", "Rusty Sword", ItemKind.WEAPON, "+2 attack.", 2, 1, False),
+        ("spear_iron", "Iron Spear", ItemKind.WEAPON, "+4 attack.", 4, 1, False),
+        ("blade_shadow", "Shadow Blade", ItemKind.WEAPON, "+6 attack.", 6, 1, False),
+        ("armor_leather", "Leather Armor", ItemKind.ARMOR, "+2 defense.", 2, 1, False),
+        ("armor_chain", "Chain Mail", ItemKind.ARMOR, "+4 defense.", 4, 1, False),
+        ("vault_key", "Vault Key", ItemKind.KEY, "Heavy iron key.", 0, 1, False),
+        ("relic_core", "Relic Core", ItemKind.KEY, "Glowing artifact.", 0, 1, False),
+    ]
+    # Convert tuples -> Item objects, indexed by ID for quick lookup.
+    return {i[0]: Item(*i) for i in items}
+
+def build_world(items_db: Dict[str, Item]) -> Dict[str, Room]:
+    """
+    Build the dungeon map and populate it with enemies/items.
+    rooms is a directed graph: room.exits maps direction -> next_room_id
+    """
+    enemies = {
+        "rat": Enemy("rat", "Plague Rat", 10, 10, 3, 0, "Feral vermin.", [("potion_small", 0.3)], 15),
+        "cultist": Enemy("cultist", "Cult Sentry", 18, 18, 5, 1, "Hooded figure.", [("potion_small", 0.35), ("vault_key", 0.2)], 30),
+        "skeleton": Enemy("skeleton", "Skeletal Warrior", 15, 15, 6, 2, "Animated bones.", [("blade_shadow", 0.15), ("potion_large", 0.25)], 25),
+        "warden": Enemy("warden", "Crypt Warden", 35, 35, 8, 3, "Ancient guardian.", [("relic_core", 1.0), ("potion_large", 0.5)], 100),
+    }
+
+    return {
+        "entrance": Room(
+            "entrance",
+            "Broken Stairwell",
+            "Dust swirls in torchlight.",
+            {"north": "hall"},
+            ["sword_rusty"],
+            on_enter_text="[italic yellow]Welcome to the Crypt Vault...[/]"
+        ),
+        "hall": Room(
+            "hall",
+            "Echo Hall",
+            "Footsteps echo unnaturally.",
+            {"south": "entrance", "east": "armory", "north": "chapel"},
+            enemy=enemies["rat"],
+            trap_chance=0.1,
+            trap_damage=2
+        ),
+        "armory": Room(
+            "armory",
+            "Collapsed Armory",
+            "Rusted weapons litter the floor.",
+            {"west": "hall", "north": "storeroom"},
+            ["armor_leather", "potion_small"],
+            trap_chance=0.15,
+            trap_damage=4
+        ),
+        "storeroom": Room(
+            "storeroom",
+            "Dusty Storeroom",
+            "Old crates and supplies.",
+            {"south": "armory", "east": "catacombs"},
+            ["bomb_smoke", "spear_iron"]
+        ),
+        "catacombs": Room(
+            "catacombs",
+            "Ancient Catacombs",
+            "Skeletal remains line the walls.",
+            {"west": "storeroom"},
+            enemy=enemies["skeleton"],
+            items=["armor_chain"]
+        ),
+        "chapel": Room(
+            "chapel",
+            "Sunken Chapel",
+            "Faded murals and silent altar.",
+            {"south": "hall", "north": "vault_door"},
+            enemy=enemies["cultist"],
+            trap_chance=0.2,
+            trap_damage=3,
+            items=["potion_large"]
+        ),
+        "vault_door": Room(
+            "vault_door",
+            "Vault Door",
+            "Massive iron door with skull lock.",
+            {"south": "chapel", "north": "vault"},
+            locked=True,
+            lock_key_id="vault_key"
+        ),
+        "vault": Room(
+            "vault",
+            "The Relic Vault",
+            "Darkness. Only the Warden remains.",
+            {"south": "vault_door"},
+            enemy=enemies["warden"]
+        ),
+    }
+
+def build_random_events() -> List[RandomEvent]:
+    """
+    Random events add replay value and branching decisions.
+    Each choice maps to an "outcome key" handled by _handle_event_outcome().
+    """
+    return [
+        RandomEvent(
+            "shrine",
+            "[bold cyan]Glowing shrine discovered.[/]\nAncient power radiates.",
+            [("Pray (restore HP)", "heal"), ("Ignore", "pass")]
+        ),
+        RandomEvent(
+            "merchant",
+            "[bold yellow]Hooded merchant appears.[/]\n'Coin for goods?'",
+            [("Buy potion (10 gold)", "buy"), ("Decline", "pass")]
+        ),
+        RandomEvent(
+            "treasure",
+            "[bold green]Suspicious chest spotted.[/]\nMight be trapped...",
+            [("Open carefully", "trap_check"), ("Ignore", "pass")]
+        ),
+    ]
+
+# =========================
+# Game Engine
+# =========================
+
+class Game:
+    """
+    Main game controller. Owns:
+    - config (rules)
+    - items_db (definitions)
+    - random_events (event table)
+    - state (all mutable game data)
+
+    Game.run() starts the main loop.
+    """
+
+    def __init__(self, difficulty: Difficulty = Difficulty.NORMAL):
+        # Configuration settings for the run
+        self.config = GameConfig()
+
+        # Item database (static definitions)
+        self.items_db = build_items_db()
+
+        # Random narrative events
+        self.random_events = build_random_events()
+
+        # Create initial game state (player + world + stats)
+        self.state = GameState(
+            Player(),
+            "entrance",
+            build_world(self.items_db),
+            Statistics(),
+            difficulty=difficulty.value
+        )
+
+        # Apply difficulty scaling to player/enemies
+        self._apply_difficulty(difficulty)
+
+        logging.info(f"Game initialized: {difficulty.value}")
+
+    def _apply_difficulty(self, diff: Difficulty):
+        """
+        Difficulty affects:
+        - Player HP baseline
+        - Enemy max HP scaling
+        - Enemy attack on HARD
+        """
+        multipliers = {
+            Difficulty.EASY: (40, 0.8),   # player_hp, enemy_hp_multiplier
+            Difficulty.NORMAL: (30, 1.0),
+            Difficulty.HARD: (25, 1.5),
+        }
+
+        player_hp, enemy_mult = multipliers[diff]
+
+        # Set player max HP and current HP
+        self.state.player.max_hp = self.state.player.hp = player_hp
+
+        # Scale enemies
+        for room in self.state.rooms.values():
+            if room.enemy:
+                room.enemy.hp = room.enemy.max_hp = int(room.enemy.max_hp * enemy_mult)
+                if diff == Difficulty.HARD:
+                    room.enemy.attack += 2
+
+    # -------------------------
+    # Save / Load
+    # -------------------------
+
+    @timed
+    def save(self, filename: str = "savegame.json"):
+        """
+        Save the entire GameState to JSON.
+        We wrap it with a version number in case the schema changes later.
+        """
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "state": self.state.to_dict()}, f, indent=2)
+
+            console.print(f"[green]✓ Saved to {filename}[/]")
+            logging.info(f"Saved to {filename}")
+
+        except Exception as e:
+            console.print(f"[red]✗ Save failed: {e}[/]")
+            logging.error(f"Save failed: {e}")
+
+    @timed
+    def load(self, filename: str = "savegame.json"):
+        """
+        Load the entire GameState from JSON.
+        This restores:
+        - Player stats, inventory, equipment
+        - Rooms, visited flags, enemy HP, items on ground
+        - Turn counter, victory state, etc.
+        """
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            self.state = GameState.from_dict(payload["state"])
+
+            console.print(f"[green]✓ Loaded {filename}[/]")
+            logging.info(f"Loaded from {filename}")
+
+        except Exception as e:
+            console.print(f"[red]✗ Load failed: {e}[/]")
+            logging.error(f"Load failed: {e}")
+
+    # -------------------------
+    # Main loop
+    # -------------------------
+
+    def run(self):
+        """
+        Main game loop:
+        - Enter room -> on_enter -> trap -> random event
+        - If enemy present => combat mode
+        - Else => exploration mode
+        - Check victory/defeat conditions each loop
+        """
+        console.print(Panel("[bold magenta]CRYPT VAULT[/] — Text Dungeon Adventure", style="bold blue"))
+        console.print("Type [bold]help[/] for commands.\n")
+
+        while not self.state.game_over:
+            self.state.turn += 1
+            room = self._curr_room()
+
+            # First-time room entry logic
+            if not room.visited:
+                room.visited = True
+                self.state.stats.rooms_explored += 1
+
+                if room.on_enter_text:
+                    console.print(room.on_enter_text)
+
+                self._apply_trap(room)
+
+            # Random events only happen when not in active combat
+            if not (room.enemy and room.enemy.alive()):
+                self._check_random_event()
+
+            # Combat vs Exploration
+            if room.enemy and room.enemy.alive():
+                self._combat_loop(room)
+            else:
+                self._explore_loop()
+
+            # End conditions
+            if self.state.victory:
+                self._victory_screen()
+
+            if not self.state.player.alive():
+                self._game_over_screen()
+
+    # Convenience: current room lookup
+    _curr_room = lambda self: self.state.rooms[self.state.current_room_id]
+
+    def _describe_room(self):
+        """Display current room details."""
+        room = self._curr_room()
+
+        console.print(Panel(room.desc, title=f"[bold cyan]{room.title}[/]", border_style="bright_blue"))
+        console.print(f"[bold]Exits:[/] {pretty_list(sorted(room.exits.keys()))}")
+
+        # List items on the floor
+        if room.items:
+            console.print(f"[bold]Items:[/] {pretty_list([self.items_db[i].name for i in room.items])}")
+
+        # Show enemy if alive
+        if room.enemy and room.enemy.alive():
+            console.print(f"[red bold]Enemy:[/] {room.enemy.name} — HP {room.enemy.hp}/{room.enemy.max_hp}")
+
+    def _apply_trap(self, room: Room):
+        """
+        Traps are applied on room entry.
+        They are probabilistic and deal fixed damage.
+        """
+        if room.trap_chance > 0 and roll(room.trap_chance):
+            self.state.player.hp = clamp(self.state.player.hp - room.trap_damage, 0, self.state.player.max_hp)
+            self.state.stats.damage_taken += room.trap_damage
+            console.print(
+                f"[bold red]⚠ Trap! -{room.trap_damage} HP "
+                f"(HP: {self.state.player.hp}/{self.state.player.max_hp})[/]"
+            )
+
+    def _check_random_event(self):
+        """
+        Random events add unpredictability and branching choices.
+        Small chance per turn when not fighting.
+        """
+        if roll(self.config.random_event_chance):
+            event = random.choice(self.random_events)
+
+            console.print(Panel(event.text, title="[bold yellow]Random Event[/]", border_style="yellow"))
+
+            # Display numbered choices
+            for i, (choice_text, _) in enumerate(event.choices, 1):
+                console.print(f"{i}. {choice_text}")
+
+            try:
+                # Force the prompt to only accept valid choice numbers
+                choice_num = int(Prompt.ask("Choose", choices=[str(i) for i in range(1, len(event.choices) + 1)]))
+                outcome_key = event.choices[choice_num - 1][1]
+                self._handle_event_outcome(outcome_key)
+            except (ValueError, IndexError):
+                console.print("[red]Invalid choice.[/]")
+
+    def _handle_event_outcome(self, outcome: str):
+        """
+        Executes the event outcome by outcome key.
+        This pattern makes it easy to add new events.
+        """
+        p = self.state.player
+
+        outcomes = {
+            # Heal: restore HP
+            "heal": lambda: (
+                setattr(p, "hp", min(p.hp + 15, p.max_hp)),
+                console.print("[green]Restored! +15 HP[/]")
+            ),
+
+            # Merchant: buy potion for gold
+            "buy": lambda: (
+                (setattr(p, "gold", p.gold - 10), p.add_item("potion_small", 1), console.print("[green]Purchased Small Potion![/]"))
+                if p.gold >= 10 else console.print("[red]Not enough gold![/]")
+            ),
+
+            # Treasure chest: 50/50 good/bad
+            "trap_check": lambda: (
+                (setattr(p, "gold", p.gold + 20), console.print("[green]Found 20 gold![/]"))
+                if roll(0.5) else
+                (setattr(p, "hp", clamp(p.hp - 5, 0, p.max_hp)), console.print("[red]Trapped! -5 HP[/]"))
+            ),
+
+            # Ignore / do nothing
+            "pass": lambda: console.print("[dim]You move on...[/]")
+        }
+
+        outcomes[outcome]()
+
+    def _explore_loop(self):
+        """Exploration mode prompt."""
+        self._describe_room()
+        self._handle_command(Prompt.ask("\n[green]>[/]").strip())
+
+    def _combat_loop(self, room: Room):
+        """Combat mode prompt (different command set)."""
+        console.print(f"\n[bold red]⚔ Combat:[/] {room.enemy.name} (HP {room.enemy.hp}/{room.enemy.max_hp})")
+        console.print("[dim]Commands: attack, flee, use <item>, inv, stats[/]")
+        self._handle_combat_command(Prompt.ask("[yellow]>[/]").strip(), room)
+
+    # -------------------------
+    # Command Handling
+    # -------------------------
+
+    def _handle_command(self, raw: str):
+        """
+        Parse exploration commands:
+        - normalize (lowercase, synonyms)
+        - dispatch to handler functions
+        """
+        if not raw:
+            return
+
+        parts = raw.lower().split()
+        verb = SYNONYMS.get(parts[0], parts[0])
+        args = " ".join(parts[1:])
+
+        # Map verbs to actions
+        commands = {
+            "help": self._show_help,
+            "look": self._describe_room,
+            "take": lambda: self._take(args or Prompt.ask("Take what?")),
+            "use": lambda: self._use(args or Prompt.ask("Use what?")),
+            "equip": lambda: self._equip(args or Prompt.ask("Equip what?")),
+            "inv": self._show_inventory,
+            "stats": self._show_stats,
+            "save": lambda: self.save(args or "savegame.json"),
+            "load": lambda: (self.load(args or "savegame.json"), self._describe_room()),
+            "quit": lambda: sys.exit(0) if Confirm.ask("Really quit?") else None,
+        }
+
+        try:
+            # Movement: either "go north" or "north"
+            if verb in ("go", "north", "south", "east", "west"):
+                self._move(args if verb == "go" else verb)
+            elif verb in commands:
+                commands[verb]()
+            else:
+                console.print("[red]Unknown command. Type 'help'.[/]")
+
+        except GameError as e:
+            # Catch domain errors and print them cleanly
+            console.print(f"[red]{e}[/]")
+
+    def _handle_combat_command(self, raw: str, room: Room):
+        """
+        Parse combat commands.
+        Similar structure to exploration parsing but with combat-only actions.
+        """
+        if not raw:
+            return
+
+        parts = raw.lower().split()
+        verb = SYNONYMS.get(parts[0], parts[0])
+        args = " ".join(parts[1:])
+
+        try:
+            if verb in ("attack", "a"):
+                self._player_attack(room.enemy)
+
+                # Enemy retaliates if still alive
+                if room.enemy.alive():
+                    self._enemy_attack(room.enemy)
+                else:
+                    self._victory_combat(room)
+
+            elif verb == "flee":
+                self._attempt_flee(room)
+
+            elif verb in ("use", "u"):
+                self._use(args or Prompt.ask("Use what?"))
+
+                # Using an item costs your action; enemy gets a turn
+                if room.enemy.alive():
+                    self._enemy_attack(room.enemy)
+
+            elif verb in ("inv", "stats"):
+                getattr(self, f"_show_{verb}")()
+
+            elif verb == "save":
+                self.save(args or "savegame.json")
+
+            else:
+                console.print("[red]Combat: attack, flee, use <item>, inv, stats[/]")
+
+        except GameError as e:
+            console.print(f"[red]{e}[/]")
+
+    def _find_item(self, name: str, context: Optional[List[str]] = None) -> Optional[str]:
+        """
+        Fuzzy item finder:
+        - name is user input ("potion", "rusty")
+        - context restricts search (room items or inventory)
+        Returns item_id if found else None.
+        """
+        search = context if context else list(self.items_db.keys())
+        return next(
+            (iid for iid in search if iid in self.items_db and name.lower() in self.items_db[iid].name.lower()),
+            None
+        )
+
+    # -------------------------
+    # Movement & Interaction
+    # -------------------------
+
+    def _move(self, direction: str):
+        """Move player to another room if possible."""
+        room = self._curr_room()
+
+        if direction not in room.exits:
+            raise InvalidActionError(f"Cannot go {direction} from here.")
+
+        next_room = self.state.rooms[room.exits[direction]]
+
+        # Locked door logic
+        if next_room.locked:
+            if next_room.lock_key_id and self.state.player.has_item(next_room.lock_key_id):
+                console.print(f"[yellow]Unlocked with {self.items_db[next_room.lock_key_id].name}.[/]")
+                next_room.locked = False
+            else:
+                raise InvalidActionError(f"Locked. Need {self.items_db[next_room.lock_key_id].name}.")
+
+        self.state.current_room_id = room.exits[direction]
+        console.print(f"[dim]You move {direction}...[/]\n")
+
+    def _take(self, item_name: str):
+        """Pick up an item from the room floor and add it to inventory."""
+        room = self._curr_room()
+
+        if not room.items:
+            raise InvalidActionError("Nothing to take here.")
+
+        item_id = self._find_item(item_name, room.items)
+        if not item_id:
+            raise ItemNotFoundError(f"Can't find '{item_name}' here.")
+
+        room.items.remove(item_id)
+        self.state.player.add_item(item_id, 1)
+        self.state.stats.items_collected += 1
+
+        console.print(f"[green]Taken: {self.items_db[item_id].name}[/]")
+
+    def _use(self, item_name: str):
+        """
+        Use a consumable item (potions, bombs).
+        - Potions heal immediately.
+        - Smoke bomb influences flee chance and is consumed on successful flee.
+        """
+        item_id = self._find_item(item_name, list(self.state.player.inventory.keys()))
+        if not item_id:
+            raise ItemNotFoundError(f"You don't have '{item_name}'.")
+
+        item = self.items_db[item_id]
+
+        if item.kind != ItemKind.CONSUMABLE:
+            raise InvalidActionError(f"Cannot use {item.name}. Try 'equip'.")
+
+        # Potion logic
+        if "potion" in item_id:
+            old_hp = self.state.player.hp
+            self.state.player.hp = min(self.state.player.hp + item.power, self.state.player.max_hp)
+            healed = self.state.player.hp - old_hp
+
+            console.print(
+                f"[green]Used {item.name}. Healed {healed} HP! "
+                f"(HP: {self.state.player.hp}/{self.state.player.max_hp})[/]"
+            )
+
+            # Remove one potion from inventory
+            self.state.player.add_item(item_id, -1)
+
+        # Bomb logic (doesn't apply instantly; used at flee time)
+        elif "bomb" in item_id:
+            console.print(f"[yellow]{item.name} will be used when you flee.[/]")
+            # Note: we do NOT remove it here; it is consumed upon successful flee.
+        else:
+            console.print(f"[yellow]Used {item.name}.[/]")
+            self.state.player.add_item(item_id, -1)
+
+    def _equip(self, item_name: str):
+        """
+        Equip a weapon or armor from inventory.
+        Equipping changes stats through attack_value/defense_value methods.
+        """
+        item_id = self._find_item(item_name, list(self.state.player.inventory.keys()))
+        if not item_id:
+            raise ItemNotFoundError(f"You don't have '{item_name}'.")
+
+        item = self.items_db[item_id]
+        p = self.state.player
+
+        if item.kind == ItemKind.WEAPON:
+            old = p.equipped_weapon
+            p.equipped_weapon = item_id
+            console.print(f"[green]Equipped: {item.name} (+{item.power} ATK)[/]")
+            if old:
+                console.print(f"[dim]Unequipped: {self.items_db[old].name}[/]")
+
+        elif item.kind == ItemKind.ARMOR:
+            old = p.equipped_armor
+            p.equipped_armor = item_id
+            console.print(f"[green]Equipped: {item.name} (+{item.power} DEF)[/]")
+            if old:
+                console.print(f"[dim]Unequipped: {self.items_db[old].name}[/]")
+
+        else:
+            raise InvalidActionError(f"Cannot equip {item.name}.")
+
+    # -------------------------
+    # Combat
+    # -------------------------
+
+    def _player_attack(self, enemy: Enemy):
+        """
+        Player attack logic:
+        - compute base damage using (player attack - enemy defense)
+        - allow critical hits
+        - apply damage, track stats
+        """
+        p = self.state.player
+
+        is_crit = roll(self.config.crit_chance)
+        base_dmg = max(1, p.attack_value(self.items_db) - enemy.defense)
+        damage = int(base_dmg * self.config.crit_multiplier) if is_crit else base_dmg
+
+        enemy.hp = max(0, enemy.hp - damage)
+
+        # Track session stats
+        self.state.stats.damage_dealt += damage
+        if is_crit:
+            self.state.stats.crits_landed += 1
+
+        console.print(
+            f"[{'bold yellow' if is_crit else 'green'}]"
+            f"{'💥 CRITICAL HIT! ' if is_crit else ''}"
+            f"You deal {damage} damage to {enemy.name}![/]"
+        )
+        console.print(f"[red]{enemy.name}: {enemy.hp}/{enemy.max_hp} HP[/]")
+
+    def _enemy_attack(self, enemy: Enemy):
+        """
+        Enemy attack logic:
+        - enemy attack minus player's total defense
+        - minimum 1 damage
+        - apply damage, track stats, check death
+        """
+        damage = max(1, enemy.attack - self.state.player.defense_value(self.items_db))
+        self.state.player.hp = max(0, self.state.player.hp - damage)
+
+        # Track stats
+        self.state.stats.damage_taken += damage
+
+        console.print(f"[red]💢 {enemy.name} attacks! You take {damage} damage.[/]")
+        console.print(f"[yellow]Your HP: {self.state.player.hp}/{self.state.player.max_hp}[/]")
+
+        if not self.state.player.alive():
+            self.state.game_over = True
+
+    def _victory_combat(self, room: Room):
+        """
+        Called when an enemy dies.
+        Rewards:
+        - update kill count
+        - give XP
+        - generate loot drops into the room
+        """
+        enemy = room.enemy
+
+        console.print(f"\n[bold green]🗡 Victory! {enemy.name} defeated!\n[/]")
+
+        self.state.stats.enemies_killed += 1
+        self._gain_xp(enemy.xp_reward)
+
+        # Loot roll
+        for item_id, drop_chance in enemy.loot_table:
+            if roll(drop_chance):
+                room.items.append(item_id)
+                console.print(f"[yellow]💎 {enemy.name} dropped: {self.items_db[item_id].name}[/]")
+
+                # If the relic drops, you win
+                if item_id == "relic_core":
+                    self.state.victory = True
+
+    def _attempt_flee(self, room: Room):
+        """
+        Flee logic:
+        - base chance
+        - if you have a smoke bomb, increase chance (and consume on success)
+        - on success, move to a random connected room
+        """
+        p = self.state.player
+
+        flee_chance = self.config.base_flee_chance + (self.config.smoke_bomb_bonus if p.has_item("bomb_smoke") else 0)
+
+        if roll(flee_chance):
+            console.print("[green]✓ You escaped![/]")
+
+            # Consume smoke bomb only when it actually helps you escape
+            if p.has_item("bomb_smoke"):
+                p.add_item("bomb_smoke", -1)
+                console.print("[dim]Smoke Bomb used.[/]")
+
+            # Move to a random exit (panic run)
+            self.state.current_room_id = room.exits[random.choice(list(room.exits.keys()))]
+            self.state.stats.successful_flees += 1
+        else:
+            console.print("[red]✗ Escape failed![/]")
+            self._enemy_attack(room.enemy)
+
+    # -------------------------
+    # Progression
+    # -------------------------
+
+    def _gain_xp(self, amount: int):
+        """
+        Add XP and level up as needed.
+        Uses a simple linear curve: level * xp_per_level.
+        """
+        self.state.player.xp += amount
+        console.print(f"[cyan]+{amount} XP[/]")
+
+        # While you have enough XP to level up, keep leveling
+        while self.state.player.xp >= self._xp_for_next_level():
+            needed = self._xp_for_next_level()
+            self.state.player.xp -= needed
+            self._level_up()
+
+    _xp_for_next_level = lambda self: self.state.player.level * self.config.xp_per_level
+
+    def _level_up(self):
+        """
+        Level up:
+        - raise level
+        - improve stats
+        - restore HP to full (common RPG behavior)
+        """
+        p = self.state.player
+
+        p.level += 1
+        p.max_hp += 5
+        p.hp = p.max_hp
+        p.base_attack += 1
+        p.base_defense += 1
+
+        console.print(Panel(
+            f"[bold yellow]⭐ LEVEL UP![/]\nNow level {p.level}\n\n"
+            f"[green]+5 Max HP\n+1 Attack\n+1 Defense[/]\n"
+            f"[cyan]HP fully restored![/]",
+            title="Level Up!",
+            border_style="yellow"
+        ))
+
+    # -------------------------
+    # UI / Help / Inventory / Stats
+    # -------------------------
+
+    def _show_help(self):
+        """Display command list in a formatted table."""
+        table = Table(title="Commands", box=box.ROUNDED, border_style="cyan")
+        table.add_column("Command", style="bold")
+        table.add_column("Description")
+        for cmd, desc in [
+            ("look (l)", "Examine room"),
+            ("go <dir> / n/s/e/w", "Move"),
+            ("take <item>", "Pick up"),
+            ("use <item>", "Use consumable"),
+            ("equip <item>", "Equip gear"),
+            ("inv (i)", "Inventory"),
+            ("stats", "Character stats"),
+            ("attack (a)", "Attack (combat)"),
+            ("flee", "Escape (combat)"),
+            ("save/load [file]", "Persistence"),
+            ("quit", "Exit"),
+        ]:
+            table.add_row(cmd, desc)
+        console.print(table)
+
+    def _show_inventory(self):
+        """Display inventory in a table including equipped items."""
+        p = self.state.player
+        if not p.inventory:
+            return console.print("[dim]Inventory: empty[/]")
+
+        table = Table(title=f"Inventory ({len(p.inventory)} items)", box=box.SIMPLE, border_style="green")
+        for col in ["Item", "Type", "Qty", "Details"]:
+            table.add_column(col, style="bold" if col == "Item" else None,
+                             justify="right" if col == "Qty" else "left")
+
+        for iid in sorted(p.inventory.keys()):
+            item = self.items_db[iid]
+            equipped = "[bold cyan](equipped)[/]" if iid in (p.equipped_weapon, p.equipped_armor) else ""
+            details = f"+{item.power} {equipped}".strip() if item.power > 0 else equipped
+            table.add_row(item.name, item.kind.value, str(p.inventory[iid]) if p.inventory[iid] > 1 else "", details)
+
+        console.print(table)
+
+    def _show_stats(self):
+        """Display player stats + session statistics."""
+        p, s = self.state.player, self.state.stats
+
+        weapon = self.items_db[p.equipped_weapon].name if p.equipped_weapon else "(bare fists)"
+        armor = self.items_db[p.equipped_armor].name if p.equipped_armor else "(cloth rags)"
+
+        stats_text = (
+            f"[bold cyan]{p.name}[/] — Level {p.level}\n\n"
+            f"[green]HP:[/] {p.hp}/{p.max_hp}\n"
+            f"[red]Attack:[/] {p.attack_value(self.items_db)}\n"
+            f"[blue]Defense:[/] {p.defense_value(self.items_db)}\n"
+            f"[yellow]XP:[/] {p.xp}/{self._xp_for_next_level()}\n"
+            f"[yellow]Gold:[/] {p.gold}\n\n"
+            f"[dim]Weapon:[/] {weapon}\n"
+            f"[dim]Armor:[/] {armor}"
+        )
+        console.print(Panel(stats_text, title="Character Stats", border_style="bright_magenta"))
+
+        stats_table = Table(title="Session Statistics", box=box.MINIMAL, border_style="dim")
+        stats_table.add_column("Stat")
+        stats_table.add_column("Value", justify="right")
+
+        for stat, val in [
+            ("Enemies Killed", s.enemies_killed),
+            ("Rooms Explored", s.rooms_explored),
+            ("Items Collected", s.items_collected),
+            ("Damage Dealt", s.damage_dealt),
+            ("Damage Taken", s.damage_taken),
+            ("Critical Hits", s.crits_landed),
+            ("Successful Flees", s.successful_flees),
+            ("Turns Elapsed", self.state.turn),
+        ]:
+            stats_table.add_row(stat, str(val))
+
+        console.print(stats_table)
+
+    # -------------------------
+    # End Screens
+    # -------------------------
+
+    def _victory_screen(self):
+        """Displayed once when victory condition triggers."""
+        s, p = self.state.stats, self.state.player
+
+        victory_text = (
+            f"[bold green]🏆 VICTORY! 🏆[/]\n\n"
+            f"You escape with the [bold yellow]Relic Core[/]!\n"
+            f"The ancient power is yours.\n\n"
+            f"[cyan]Final Level:[/] {p.level}\n"
+            f"[cyan]Turns:[/] {self.state.turn}\n"
+            f"[cyan]Enemies:[/] {s.enemies_killed}\n"
+            f"[cyan]Rooms:[/] {s.rooms_explored}"
+        )
+
+        console.print(Panel(
+            victory_text,
+            title="The vault falls silent...",
+            border_style="bold green",
+            padding=(1, 2)
+        ))
+        self.state.game_over = True
+
+    def _game_over_screen(self):
+        """Displayed once when player dies."""
+        console.print(Panel(
+            f"[bold red]💀 GAME OVER 💀[/]\n\n"
+            f"You have fallen in the crypt.\n"
+            f"Journey ends at level {self.state.player.level}.\n\n"
+            f"[dim]Turns: {self.state.turn}\n"
+            f"Enemies: {self.state.stats.enemies_killed}[/]",
+            title="Death's Embrace",
+            border_style="red",
+            padding=(1, 2)
+        ))
+        self.state.game_over = True
+
+# =========================
+# Tests (Lightweight)
+# =========================
+
+def run_tests():
+    """
+    Minimal test runner for quick validation without external frameworks.
+    (You could migrate to pytest later if desired.)
+    """
+    console.print("[bold blue]Running test suite...[/]\n")
+
+    tests = [
+        test_item_system,
+        test_combat_system,
+        test_persistence,
+        test_navigation,
+        test_inventory,
+        test_progression,
+    ]
+
+    try:
+        for test in tests:
+            test()
+        console.print("\n[bold green]✓ All tests passed![/]")
+    except AssertionError as e:
+        console.print(f"\n[bold red]✗ Test failed: {e}[/]")
+        raise
+
+def test_item_system():
+    console.print("[cyan]Testing item system...[/]")
+    game = Game()
+    assert "potion_small" in game.items_db and game.items_db["potion_small"].kind == ItemKind.CONSUMABLE
+    assert game._find_item("rusty") == "sword_rusty"
+    console.print("[green]  ✓ Item system passed[/]")
+
+def test_combat_system():
+    console.print("[cyan]Testing combat...[/]")
+    game = Game()
+    enemy = Enemy("test", "Test", 20, 20, 5, 1, "Test", [], 10)
+
+    initial_hp = enemy.hp
+    game._player_attack(enemy)
+    assert enemy.hp < initial_hp
+
+    game.state.player.equipped_weapon = "spear_iron"
+    assert game.state.player.attack_value(game.items_db) == 8
+    console.print("[green]  ✓ Combat passed[/]")
+
+def test_persistence():
+    console.print("[cyan]Testing save/load...[/]")
+    game = Game()
+    game.state.player.hp, game.state.player.level = 15, 3
+    game.state.player.add_item("potion_small", 2)
+
+    game.save("test_save.json")
+    game.load("test_save.json")
+
+    assert game.state.player.hp == 15 and game.state.player.level == 3
+
+    import os
+    os.remove("test_save.json")
+
+    console.print("[green]  ✓ Persistence passed[/]")
+
+def test_navigation():
+    console.print("[cyan]Testing navigation...[/]")
+    game = Game()
+    initial = game.state.current_room_id
+
+    game._move("north")
+    assert game.state.current_room_id != initial
+
+    try:
+        game._move("up")   # invalid direction should raise
+        assert False
+    except InvalidActionError:
+        pass
+
+    console.print("[green]  ✓ Navigation passed[/]")
+
+def test_inventory():
+    console.print("[cyan]Testing inventory...[/]")
+    p = Game().state.player
+
+    p.add_item("potion_small", 3)
+    assert p.has_item("potion_small", 3)
+
+    p.add_item("potion_small", -1)
+    assert p.has_item("potion_small", 2)
+
+    console.print("[green]  ✓ Inventory passed[/]")
+
+def test_progression():
+    console.print("[cyan]Testing progression...[/]")
+    game = Game()
+
+    initial_level = game.state.player.level
+    game._gain_xp(game.config.xp_per_level)
+    assert game.state.player.level == initial_level + 1
+
+    console.print("[green]  ✓ Progression passed[/]")
+
+# =========================
+# Main Entrypoint
+# =========================
+
+def main() -> int:
+    """
+    CLI entry:
+    - test: run built-in tests
+    - load <file>: load and start
+    - easy|normal|hard: start new game with difficulty
+    """
+    random.seed()  # seed RNG from system entropy
+
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "test":
+            return run_tests() or 0
+
+        elif sys.argv[1] == "load" and len(sys.argv) > 2:
+            game = Game()
+            game.load(sys.argv[2])
+            game.run()
+            return 0
+
+        elif sys.argv[1] in ("easy", "normal", "hard"):
+            diff = Difficulty(sys.argv[1])
+            console.print(f"[yellow]Starting on {diff.value.upper()} difficulty[/]\n")
+            Game(diff).run()
+            return 0
+
+    # Default: normal difficulty new game
+    Game().run()
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
