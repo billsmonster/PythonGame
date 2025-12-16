@@ -1,7 +1,3 @@
-Here’s a **clean, professional, portfolio-ready README.md** you can drop directly into the repo.
-It’s written the way **recruiters, hiring managers, and GitHub reviewers** expect.
-
----
 
 #  Crypt Vault
 
